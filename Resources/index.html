@@ -83,10 +83,12 @@ body.powidle .srcpill .dot{animation-play-state:paused!important}
 }
 
 /* ============ 布局 ============ */
-.app{position:relative;z-index:3;max-width:1180px;margin:0 auto;padding:0 16px 150px}
+.app{position:relative;z-index:3;max-width:1180px;margin:0 auto;
+  /* 顶部留出安全区：iPhone 灵动岛/刘海下不能压内容（env 在普通浏览器里是 0） */
+  padding:env(safe-area-inset-top, 0px) 16px 150px}
 
 .topbar{
-  position:sticky;top:12px;z-index:40;display:flex;align-items:center;gap:12px;
+  position:sticky;top:calc(12px + env(safe-area-inset-top, 0px));z-index:40;display:flex;align-items:center;gap:12px;
   margin:12px 0 6px;padding:10px 12px 10px 16px;border-radius:22px;
 }
 .brand{display:flex;align-items:center;gap:11px;flex:1;min-width:0}
@@ -1003,6 +1005,8 @@ const state = {
   site: null
 };
 let hls = null, currentId = null, saveTick = 0, hideTimer = null;
+/* 当前这次起播的自动抢救状态：直连失败 → 走本机 HLS 通道 → 实在不行换源 */
+let pRecover = null;
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -1074,6 +1078,16 @@ function fmt(t) {
   return h > 0 ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
 }
 function isHls(u) { return /\.m3u8(\?|#|$)/i.test(u); }
+/* 有些源站的播放地址里直接带中文目录（…/video/仙逆/第03集/index.m3u8）。
+   浏览器拿到没编码的地址有时会当非法 URL 直接判"放不了"，这里先把非 ASCII 段编码掉。 */
+function encUrl(u) {
+  return String(u || '').replace(/[^\x00-\x7F]+/g, m => {
+    try { return encodeURIComponent(m); } catch (e) { return m; }
+  });
+}
+/* 本机服务端口：/h 是自带的 HLS 兜底通道，只有跑在 127.0.0.1 上才有 */
+function localGate() { return /^https?:$/.test(location.protocol) && /^127\.0\.0\.1:\d+$/.test(location.host); }
+
 function toast(msg) {
   const el = $('#toast');
   el.textContent = msg;
@@ -1925,6 +1939,7 @@ async function openPlayer(id, startAt) {
   // 关键：Android WebView 的 canPlayType 会谎报支持 HLS（返回 "maybe"）却播不了，
   // 所以只要 hls.js 可用就走 MSE，别信它自报；拿不到 hls.js 才退回原生。
   // 网页版反过来：iPhone Safari 没有 MSE（hls.js 用不了），它自带原生 HLS，直接交给 video 播。
+  pRecover = { raw: it.url, relayed: false, switched: 0 };
   if (isHls(it.url) && !IS_WEB) {
     const ok = window.loadHls ? await window.loadHls() : false;
     if (ok && window.Hls && Hls.isSupported()) {
@@ -1943,7 +1958,7 @@ async function openPlayer(id, startAt) {
         startFragPrefetch: true,
         testBandwidth: false
       });
-      hls.loadSource(it.url);
+      hls.loadSource(encUrl(it.url));
       hls.attachMedia(video);
       hls.on(Hls.Events.FRAG_LOADED, (e, data) => { pSpdPush(data); });
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -1960,10 +1975,10 @@ async function openPlayer(id, startAt) {
       });
     } else {
       console.log('[play] hls.js 不可用，回退原生');
-      video.src = it.url;
+      video.src = encUrl(it.url);
     }
   } else {
-    video.src = it.url;
+    video.src = encUrl(it.url);
     video.addEventListener('loadedmetadata', function once() {
       video.removeEventListener('loadedmetadata', once);
       if (!applyResume() && resumeAt && resumeAt < video.duration - 2) video.currentTime = resumeAt;
@@ -3298,7 +3313,10 @@ video.addEventListener('loadedmetadata', () => { applyResume(); pPaint(); pSyncE
 video.addEventListener('progress', () => { try { pPaint(); } catch (e) {} });
 video.addEventListener('error', () => {
   pSpinnerOff();
-  toast('这条链接播不了，检查格式或网络');
+  // 拆旧媒体（removeAttribute + load）时也可能抛 error：没有地址就不算真失败
+  if (!video.getAttribute('src') && !video.currentSrc) return;
+  if (!$('#player').classList.contains('on')) return;
+  pRecoverFromError();
 });
 /* 缓冲提示：一开始是「火速加载中…」，卡超过 5 秒就变成实话 */
 let spinT = 0;
@@ -3319,6 +3337,66 @@ function pSpinnerOff() {
   clearTimeout(spinT);
   const sp = $('#spinner');
   if (sp) { sp.classList.remove('on', 'slow'); }
+}
+
+/* ---- 播放抢救：直连不通 → 走本机 HLS 通道 → 自动换源，不让用户干瞪报错 ---- */
+function pAttachNative(u) {
+  try { if (hls) { hls.destroy(); hls = null; } } catch (e) {}
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  video.src = encUrl(u);
+  video.addEventListener('loadedmetadata', function once() {
+    video.removeEventListener('loadedmetadata', once);
+    if (!applyResume() && pendingResume && pendingResume < (video.duration || 0) - 2) video.currentTime = pendingResume;
+  });
+  video.play().catch(() => {});
+}
+
+async function pRecoverFromError() {
+  const it = state.items.find(i => i.id === currentId);
+  if (!it) return;
+  const rc = pRecover || (pRecover = { raw: it.url, relayed: false, switched: 0 });
+  // 媒体可能连抛几次 error：2.5 秒内只处理一次，别把换源触发成一串
+  const now = Date.now();
+  if (rc.t && now - rc.t < 2500) return;
+  rc.t = now;
+  const code = (video.error && video.error.code) || 0;
+  console.log('[play] 播放失败 code=' + code + ' url=' + String(it.url).slice(0, 90));
+
+  // 1) 直连放不了，先换本机 HLS 通道：能绕开中文路径没编码 / 防盗链查 Referer / CDN 挑 UA
+  if (!rc.relayed && localGate() && isHls(it.url)) {
+    rc.relayed = true;
+    pSpinnerOn('换个通道再试…');
+    const gate = '/h?u=' + encodeURIComponent(it.url);
+    try {
+      const r = await fetch(gate, { cache: 'no-store' });
+      if (r.ok) { pAttachNative(gate); return; }
+    } catch (e) {}
+    pSpinnerOff();
+  }
+
+  // 2) 这条源真不通：自动换同名片的其它源播，进度接着来
+  if (rc.switched < 1) {
+    rc.switched++;
+    pSpinnerOn('这条源播不了，正在换源…');
+    const nm = String(it.title || '').split(' · ')[0];
+    try {
+      const cands = await collectCrossSource(nm);
+      const cur = String(it.source || '').replace(/[┃|]/g, '').trim();
+      const next = (cands || []).find(c => {
+        const sn = String((c.site && c.site.name) || '').replace(/[┃|]/g, '').trim();
+        return sn && sn !== cur;
+      });
+      if (next && playCtx && playCtx.d) {
+        pSpinnerOff();
+        switchSource(next);
+        return;
+      }
+    } catch (e) {}
+  }
+  pSpinnerOff();
+  toast('这条源播不了，点「换源」挑别的线路');
 }
 
 /* ==================== 卡片交互 ==================== */
@@ -4796,8 +4874,8 @@ async function doSiteSearch(kw) {
     $('#searchBody').innerHTML = '<div class="empty-sm">还没有可用的源站</div>';
     return;
   }
-  const list = pool.slice(0, 32);
-  searchState = { q, kw, got: [], done: 0, hit: 0, total: list.length };
+  const list = pool.slice(0, 14);
+  searchState = { q, kw, got: [], done: 0, hit: 0, total: list.length, probing: false };
   $('#searchBody').innerHTML = `<div class="srhd" id="searchProg">正在并发搜索 ${list.length} 个源站…</div>
     <div class="pgrid" id="searchGrid"></div>`;
 
@@ -4820,7 +4898,7 @@ async function doSiteSearch(kw) {
     while (qi < list.length) {
       const t = list[qi++];
       try {
-        const j = await getJSON(apiUrl(t.s.api, 'ac=videolist&wd=' + encodeURIComponent(kw)), 7000);
+        const j = await getJSON(apiUrl(t.s.api, 'ac=videolist&wd=' + encodeURIComponent(kw)), 5000);
         // 有的源不认 wd，会把整个片库返回来。只留片名真的含关键词的，否则首页全是杂质
         const items = (j.list || []).filter(v => v && v.vod_name && normKw(v.vod_name).indexOf(q) >= 0);
         if (items.length) {
@@ -4837,12 +4915,12 @@ async function doSiteSearch(kw) {
       paint(0);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(10, list.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(14, list.length) }, worker));
   paint(1);
   // 命中的源后台补测档位（不挡首屏）
   probeSearchHits();
   // 第二轮：剩下的源接着搜，结果直接并进来 —— 既保住首屏速度，又不漏掉好源
-  const rest = pool.slice(list.length, list.length + 28);
+  const rest = pool.slice(list.length, list.length + 26);
   if (rest.length && my === searchSeq) {
     searchState.total += rest.length;
     let ri = 0;
@@ -4850,7 +4928,7 @@ async function doSiteSearch(kw) {
       while (ri < rest.length) {
         const t = rest[ri++];
         try {
-          const j = await getJSON(apiUrl(t.s.api, 'ac=videolist&wd=' + encodeURIComponent(kw)), 7000);
+          const j = await getJSON(apiUrl(t.s.api, 'ac=videolist&wd=' + encodeURIComponent(kw)), 6000);
           const items = (j.list || []).filter(v => v && v.vod_name && normKw(v.vod_name).indexOf(q) >= 0);
           if (items.length) {
             searchState.hit++;
@@ -5066,6 +5144,7 @@ async function probeSearchHits() {
   const st = searchState;
   if (!st) return;
   const seq = ++searchProbeSeq;
+  st.probing = true;
   // 按「片名组」挑要量的：精确命中的正片组排最前，把它的每个候选源都量一遍。
   // 之前是"每个源只量它搜到的第一条"，源先返回了别的片，正片候选就漏量了，
   // 排序只能退回源级指标——"第一个不是最优的"就是这么来的。
@@ -5092,7 +5171,7 @@ async function probeSearchHits() {
     if (jobs.length >= 14) break;   // 优先把头部片名的候选量完，长尾的随缘
   }
   const list = jobs.slice(0, 14);
-  if (!list.length) return;
+  if (!list.length) { st.probing = false; return; }
   let i = 0;
   const worker = async () => {
     while (i < list.length) {
@@ -5122,6 +5201,11 @@ async function probeSearchHits() {
     }
   };
   await Promise.all(Array.from({ length: Math.min(4, list.length) }, worker));
+  // 测完收工：卡片补齐真实码率/速度，把「测速中」换掉
+  if (st === searchState) {
+    st.probing = false;
+    if (seq === searchProbeSeq) { syncGotMetrics(); try { renderSearchOut(); } catch (err) {} }
+  }
 }
 
 function searchCardHTML(v, i) {
@@ -5131,7 +5215,14 @@ function searchCardHTML(v, i) {
   const badges = [];
   if (i === 0) badges.push('<i class="qtag sbfast">最优</i>');
   else if (v.side) badges.push('<i class="qtag">相关</i>');
-  badges.push(tierTag(best));
+  // 只写"极速/1080P"还是太虚：把实测的码率和下载速度一起摆在卡片上
+  const nums = [];
+  if (best.mbps) nums.push(best.mbps + 'M');
+  if (best.speed) nums.push(best.speed + 'MB/s');
+  const qtag = tierTag(best);
+  if (qtag) badges.push(qtag);
+  else if (searchState && searchState.probing) badges.push('<i class="qtag q-ld">测速中…</i>');
+  if (nums.length) badges.push('<i class="qtag q-ok">' + esc(nums.join('·')) + '</i>');
   const sn = String(best.site.name || '').replace(/[┃|]/g, '').trim();
   const alt = v.cands.length > 1 ? ' 等' + v.cands.length + '源' : '';
   return `<article class="pcard" data-idx="${i}">
