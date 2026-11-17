@@ -13,8 +13,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         w.makeKeyAndVisible()
         window = w
 
-        // 看片时别让系统自动锁屏
-        application.isIdleTimerDisabled = true
+        // 注意：这里不再全局禁锁屏。防锁屏只在「视频真正在播」时由 WebViewController 打开，
+        // 否则 App 停在前台不动时屏幕会一直亮着，白耗电。
         return true
     }
 }
