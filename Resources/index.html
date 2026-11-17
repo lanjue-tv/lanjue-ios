@@ -3379,6 +3379,11 @@ async function pRecoverFromError() {
   // 2) 这条源真不通：自动换同名片的其它源播，进度接着来
   if (rc.switched < 1) {
     rc.switched++;
+    // 这条源既然播不了，就别再记它"最优"，否则下次点开还是先撞一次墙
+    try {
+      const q = normKw(String(it.title || '').split(' · ')[0]);
+      if (q && BEST[q]) { delete BEST[q]; bestSave(); }
+    } catch (e) {}
     pSpinnerOn('这条源播不了，正在换源…');
     const nm = String(it.title || '').split(' · ')[0];
     try {
