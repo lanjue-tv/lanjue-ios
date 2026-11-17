@@ -15,6 +15,16 @@ settings:
     CODE_SIGNING_REQUIRED: "NO"
     CODE_SIGNING_ALLOWED: "NO"
 
+schemes:
+  LanJueTV:
+    build:
+      targets:
+        LanJueTV: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
 targets:
   LanJueTV:
     type: application
