@@ -1,28 +1,47 @@
 name: Build IPA
 
 # 用 GitHub 免费 macOS 机器编译出 unsigned .ipa，下载后自行签名安装。
-# 触发方式：网页上点 Run workflow，或向仓库 push 任意改动。
+# 触发方式：网页上点 Run workflow（可选机器标签），或向仓库 push 任意改动。
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner label'
+        required: false
+        default: 'macos-latest'
+      tag:
+        description: 'artifact name suffix'
+        required: false
+        default: 'default'
 
 jobs:
   build:
-    runs-on: macos-latest
-    timeout-minutes: 25
+    runs-on: ${{ github.event.inputs.runner || 'macos-latest' }}
+    timeout-minutes: 30
     steps:
+      - name: 环境信息
+        run: |
+          sw_vers || true
+          xcodebuild -version || true
+
       - name: 检出代码
         uses: actions/checkout@v4
 
       - name: 安装 XcodeGen
-        run: brew install xcodegen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen || brew upgrade xcodegen
+          fi
+          xcodegen --version
 
       - name: 生成 Xcode 工程
         run: xcodegen generate
 
       - name: 编译（不签名）
         run: |
+          set -o pipefail
           xcodebuild \
             -project LanJueTV.xcodeproj \
             -target LanJueTV \
@@ -32,12 +51,13 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build 2>&1 | tail -60
 
       - name: 打包成 ipa
         run: |
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           echo "APP=$APP"
+          test -n "$APP"
           rm -rf Payload LanJueTV.ipa
           mkdir -p Payload
           cp -R "$APP" Payload/
@@ -47,6 +67,6 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: LanJueTV-unsigned-ipa
+          name: LanJueTV-ipa-${{ github.event.inputs.tag || 'auto' }}
           path: LanJueTV.ipa
           retention-days: 30
