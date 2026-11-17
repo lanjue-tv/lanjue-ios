@@ -5220,14 +5220,19 @@ function searchCardHTML(v, i) {
   const badges = [];
   if (i === 0) badges.push('<i class="qtag sbfast">最优</i>');
   else if (v.side) badges.push('<i class="qtag">相关</i>');
-  // 只写"极速/1080P"还是太虚：把实测的码率和下载速度一起摆在卡片上
-  const nums = [];
-  if (best.mbps) nums.push(best.mbps + 'M');
-  if (best.speed) nums.push(best.speed + 'MB/s');
-  const qtag = tierTag(best);
-  if (qtag) badges.push(qtag);
-  else if (searchState && searchState.probing) badges.push('<i class="qtag q-ld">测速中…</i>');
-  if (nums.length) badges.push('<i class="qtag q-ok">' + esc(nums.join('·')) + '</i>');
+  // 只写"极速/1080P"还是太虚：把实测的分辨率和下载速度合成一个角标，一眼看到具体数字
+  const q = qualTier(best), sp = speedTier(best);
+  const seg = [];
+  if (q) seg.push((String(best.res || '').trim() ? '' : '≈') + q.n);
+  if (best.speed) seg.push(best.speed + 'MB/s');
+  else if (best.mbps) seg.push(best.mbps + 'M');
+  if (seg.length) {
+    const cls = q ? ({ 3: 'q-4k', 2: 'q-hd', 1: 'q-sd', 0: 'q-lo' }[q.k])
+      : (sp ? (sp.k === 2 ? 'q-ok' : sp.k === 1 ? 'q-mid' : 'q-bad') : 'q-ok');
+    badges.push('<i class="qtag ' + cls + '">' + esc(seg.join('·')) + '</i>');
+  } else if (searchState && searchState.probing) {
+    badges.push('<i class="qtag q-ld">测速中…</i>');
+  }
   const sn = String(best.site.name || '').replace(/[┃|]/g, '').trim();
   const alt = v.cands.length > 1 ? ' 等' + v.cands.length + '源' : '';
   return `<article class="pcard" data-idx="${i}">
