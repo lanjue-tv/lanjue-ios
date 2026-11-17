@@ -1,0 +1,39 @@
+workflows:
+  ios-unsigned:
+    name: iOS unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      xcode: latest
+      vars:
+        XCODE_PROJECT: "LanJueTV.xcodeproj"
+        XCODE_TARGET: "LanJueTV"
+    scripts:
+      - name: Generate Xcode project
+        script: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+          xcodegen generate
+      - name: Build unsigned app
+        script: |
+          set -x
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -target "$XCODE_TARGET" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+      - name: Package IPA
+        script: |
+          rm -rf Payload LanJueTV.ipa
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/LanJueTV.app" Payload/
+          zip -qry LanJueTV.ipa Payload
+          ls -lh LanJueTV.ipa
+    artifacts:
+      - LanJueTV.ipa
