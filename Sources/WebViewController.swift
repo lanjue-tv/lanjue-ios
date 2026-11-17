@@ -2,10 +2,30 @@ import UIKit
 import WebKit
 
 /// 单页外壳：WKWebView 载入本机 127.0.0.1 上的网页（资源全部打包在 App 内）
-final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
 
     private var webView: WKWebView!
     private var retried = false
+
+    /// 只在「视频真的在播放」时禁止锁屏；暂停/播完/退出播放器立刻恢复系统自动锁屏。
+    private let idleHook = """
+    (function () {
+      if (window.__ljIdleHooked) return;
+      window.__ljIdleHooked = true;
+      function post(on) {
+        try { window.webkit.messageHandlers.lanjue.postMessage({ t: 'idle', on: !!on }); } catch (e) {}
+      }
+      function isVid(el) { return el && el.tagName === 'VIDEO'; }
+      document.addEventListener('play',  function (e) { if (isVid(e.target)) post(true);  }, true);
+      document.addEventListener('playing', function (e) { if (isVid(e.target)) post(true); }, true);
+      document.addEventListener('pause', function (e) { if (isVid(e.target)) post(false); }, true);
+      document.addEventListener('ended', function (e) { if (isVid(e.target)) post(false); }, true);
+      document.addEventListener('webkitendfullscreen', function (e) {
+        if (isVid(e.target)) post(!e.target.paused);
+      }, true);
+      window.addEventListener('pagehide', function () { post(false); });
+    })();
+    """
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -23,6 +43,20 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         if #available(iOS 14.0, *) {
             cfg.defaultWebpagePreferences.allowsContentJavaScript = true
         }
+
+        // 视频播放状态 → 原生（决定是否禁止锁屏）
+        let uc = WKUserContentController()
+        uc.addUserScript(WKUserScript(source: idleHook,
+                                     injectionTime: .atDocumentStart,
+                                     forMainFrameOnly: false))
+        uc.add(self, name: "lanjue")
+        cfg.userContentController = uc
+
+        // 切到后台：让页面立刻停视频、停 HLS 下载、停解码，别在后台偷跑
+        NotificationCenter.default.addObserver(self,
+                                              selector: #selector(appDidBackground),
+                                              name: UIApplication.didEnterBackgroundNotification,
+                                              object: nil)
 
         webView = WKWebView(frame: view.bounds, configuration: cfg)
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -108,6 +142,35 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         a.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(false) })
         a.addAction(UIAlertAction(title: "确定", style: .default) { _ in completionHandler(true) })
         present(a, animated: true)
+    }
+
+    // MARK: - 省电相关
+
+    /// 页面通过 postMessage 告知视频播放状态
+    func userContentController(_ userContentController: WKUserContentController,
+                              didReceive message: WKScriptMessage) {
+        guard message.name == "lanjue",
+              let body = message.body as? [String: Any],
+              (body["t"] as? String) == "idle" else { return }
+        let playing = body["on"] as? Bool ?? false
+        UIApplication.shared.isIdleTimerDisabled = playing
+    }
+
+    @objc private func appDidBackground() {
+        // 页面里已经写好的钩子：暂停视频、hls.stopLoad、关掉常亮
+        webView?.evaluateJavaScript("window.__onAppPause && window.__onAppPause()",
+                                    completionHandler: nil)
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "lanjue")
     }
 
     private func fail(_ msg: String) {
